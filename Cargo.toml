@@ -3,7 +3,7 @@ resolver = "2"
 members = ["pool", "policy", "oracle"]
 
 [workspace.dependencies]
-soroban-sdk = { version = "21.0.0", features = ["alloc"] }
+soroban-sdk = "21.0.0"
 
 [profile.release]
 opt-level = "z"

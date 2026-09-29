@@ -495,10 +495,8 @@ impl RefractPool {
                 ],
             ),
         );
-        debug_assert_eq!(
-            _registered_id, id,
-            "registry must echo back the id the pool assigned"
-        );
+        // Verify registry echoed id without dragging format string tables into wasm
+        debug_assert!(_registered_id == id);
 
         env.events().publish(
             (symbol_short!("BUY"), holder),
