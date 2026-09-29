@@ -154,13 +154,13 @@ fn calc_shares_never_mints_value_out_of_thin_air() {
     TestRunner::default()
         .run(&cases, |(total_capital, total_shares, amount)| {
             let shares = env.as_contract(&pool_id, || {
-                env.storage()
-                    .instance()
-                    .set(&DataKey::TotalCapital, &total_capital);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::TotalShares, &total_shares);
-                RefractPool::_calc_shares(&env, amount)
+                let state = PoolState {
+                    config: config(),
+                    total_capital,
+                    total_shares,
+                    total_coverage: 0,
+                };
+                RefractPool::_calc_shares(&state, amount)
             });
 
             prop_assert!(shares >= 0);
@@ -178,9 +178,13 @@ fn calc_shares_is_1to1_when_pool_is_empty() {
     TestRunner::default()
         .run(&(0i128..1_000_000_000 * PRECISION), |amount| {
             let shares = env.as_contract(&pool_id, || {
-                env.storage().instance().set(&DataKey::TotalCapital, &0i128);
-                env.storage().instance().set(&DataKey::TotalShares, &0i128);
-                RefractPool::_calc_shares(&env, amount)
+                let state = PoolState {
+                    config: config(),
+                    total_capital: 0,
+                    total_shares: 0,
+                    total_coverage: 0,
+                };
+                RefractPool::_calc_shares(&state, amount)
             });
 
             prop_assert_eq!(shares, amount);
@@ -212,19 +216,13 @@ fn quote_withdrawal_never_returns_more_than_total_capital() {
             &cases,
             |(total_capital, total_shares, total_coverage, shares)| {
                 let result = env.as_contract(&pool_id, || {
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::TotalCapital, &total_capital);
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::TotalShares, &total_shares);
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::TotalCoverage, &total_coverage);
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::PoolConfig, &config());
-                    RefractPool::_quote_withdrawal(&env, shares)
+                    let state = PoolState {
+                        config: config(),
+                        total_capital,
+                        total_shares,
+                        total_coverage,
+                    };
+                    RefractPool::_quote_withdrawal(&state, shares)
                 });
 
                 if shares > total_shares {

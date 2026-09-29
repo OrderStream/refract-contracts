@@ -131,6 +131,54 @@ pub struct Policy {
     pub status: PolicyStatus,
     pub payout_at: Option<u64>,
 }
+/// Cached state snapshot of pool configuration and running counters.
+/// Loaded once per state-mutating entrypoint to eliminate redundant storage reads.
+#[derive(Clone, Debug)]
+pub struct PoolState {
+    pub config: PoolConfig,
+    pub total_capital: i128,
+    pub total_shares: i128,
+    pub total_coverage: i128,
+}
+
+impl PoolState {
+    /// Load current state snapshot from instance storage.
+    pub fn load(env: &Env) -> Self {
+        let config: PoolConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolConfig)
+            .unwrap_or(PoolConfig {
+                base_premium_rate_bps: 300,
+                max_utilization_bps: 8000,
+                min_coverage: 100 * PRECISION,
+                max_coverage: 50_000 * PRECISION,
+                lockup_days: 7,
+            });
+        let total_capital: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCapital)
+            .unwrap_or(0);
+        let total_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalShares)
+            .unwrap_or(0);
+        let total_coverage: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCoverage)
+            .unwrap_or(0);
+
+        Self {
+            config,
+            total_capital,
+            total_shares,
+            total_coverage,
+        }
+    }
+}
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -224,7 +272,8 @@ impl RefractPool {
         if amount <= 0 {
             return Err(PoolError::ZeroAmount);
         }
-        Ok(Self::_calc_shares(&env, amount))
+        let state = PoolState::load(&env);
+        Ok(Self::_calc_shares(&state, amount))
     }
 
     /// Deposit USDC as risk capital, receive pool shares.
@@ -235,6 +284,8 @@ impl RefractPool {
             return Err(PoolError::ZeroAmount);
         }
 
+        let state = PoolState::load(&env);
+
         let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
         token::Client::new(&env, &usdc).transfer(
             &provider,
@@ -242,26 +293,15 @@ impl RefractPool {
             &amount,
         );
 
-        let shares = Self::_calc_shares(&env, amount);
+        let shares = Self::_calc_shares(&state, amount);
 
-        let mut total_capital: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        let mut total_shares: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalShares)
-            .unwrap_or(0);
+        let total_capital = state.total_capital + amount;
+        let total_shares = state.total_shares + shares;
         let mut user_shares: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::Shares(provider.clone()))
             .unwrap_or(0);
-
-        total_capital += amount;
-        total_shares += shares;
         user_shares += shares;
 
         env.storage()
@@ -302,7 +342,8 @@ impl RefractPool {
         if shares <= 0 {
             return Err(PoolError::ZeroAmount);
         }
-        Self::_quote_withdrawal(&env, shares)
+        let state = PoolState::load(&env);
+        Self::_quote_withdrawal(&state, shares)
     }
 
     /// Withdraw capital by burning shares.
@@ -322,36 +363,29 @@ impl RefractPool {
             return Err(PoolError::InsufficientShares);
         }
 
-        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
+        let state = PoolState::load(&env);
+
         let last_deposit: Option<u64> = env
             .storage()
             .persistent()
             .get(&DataKey::LastDeposit(provider.clone()));
         if let Some(last_deposit) = last_deposit {
-            let unlocks_at = last_deposit + (config.lockup_days as u64) * 86_400;
+            let unlocks_at = last_deposit + (state.config.lockup_days as u64) * 86_400;
             if env.ledger().timestamp() < unlocks_at {
                 return Err(PoolError::LockupActive);
             }
         }
 
-        let usdc_out = Self::_quote_withdrawal(&env, shares)?;
-        let total_capital: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        let total_shares: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalShares)
-            .unwrap_or(0);
+        let usdc_out = Self::_quote_withdrawal(&state, shares)?;
+        let total_capital = state.total_capital - usdc_out;
+        let total_shares = state.total_shares - shares;
 
         env.storage()
             .instance()
-            .set(&DataKey::TotalCapital, &(total_capital - usdc_out));
+            .set(&DataKey::TotalCapital, &total_capital);
         env.storage()
             .instance()
-            .set(&DataKey::TotalShares, &(total_shares - shares));
+            .set(&DataKey::TotalShares, &total_shares);
         env.storage()
             .persistent()
             .set(&DataKey::Shares(provider.clone()), &(user_shares - shares));
@@ -378,9 +412,9 @@ impl RefractPool {
     /// tell a quote was for a purchase that could never succeed.
     pub fn quote_premium(env: Env, params: PolicyParams) -> Result<i128, PoolError> {
         Self::assert_initialized(&env)?;
-        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
-        Self::_check_coverage_capacity(&env, &config, params.coverage_amount)?;
-        Ok(Self::_calc_premium(&config, &params))
+        let state = PoolState::load(&env);
+        Self::_check_coverage_capacity(&state, params.coverage_amount)?;
+        Ok(Self::_calc_premium(&state.config, &params))
     }
 
     /// Buy an insurance policy. Caller pays the premium upfront.
@@ -388,10 +422,10 @@ impl RefractPool {
         holder.require_auth();
         Self::assert_initialized(&env)?;
 
-        let config: PoolConfig = env.storage().instance().get(&DataKey::PoolConfig).unwrap();
-        let new_coverage = Self::_check_coverage_capacity(&env, &config, params.coverage_amount)?;
+        let state = PoolState::load(&env);
+        let new_coverage = Self::_check_coverage_capacity(&state, params.coverage_amount)?;
 
-        let premium = Self::_calc_premium(&config, &params);
+        let premium = Self::_calc_premium(&state.config, &params);
         let now = env.ledger().timestamp();
         let end_time = now + (params.duration_days as u64) * 86_400;
         let registry_coverage_type = Self::_to_registry_coverage_type(&params.coverage_type);
@@ -405,12 +439,7 @@ impl RefractPool {
         );
 
         // Record in pool capital (premiums accrue to LPs)
-        let mut total_cap: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalCapital)
-            .unwrap_or(0);
-        total_cap += premium;
+        let total_cap = state.total_capital + premium;
         env.storage()
             .instance()
             .set(&DataKey::TotalCapital, &total_cap);
