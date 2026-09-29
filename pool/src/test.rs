@@ -1068,3 +1068,121 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     let res = f.pool.try_quote_withdrawal(&(shares + 1));
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
 }
+
+// ── Griefing-cost empirical tests (Issue #136) ─────────────────────────────
+
+#[test]
+fn griefing_stranger_process_claim_payout_strictly_credited_to_holder() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let stranger = funded(&f, 100 * ONE_USDC);
+
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500, // depeg below $0.95
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // Trigger depeg condition ($0.90 is below $0.95)
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(9 * ONE_USDC / 10),
+    );
+
+    let holder_before = f.usdc.balance(&holder);
+    let stranger_before = f.usdc.balance(&stranger);
+
+    // Stranger calls process_claim (permissionless entrypoint)
+    let payout = f.pool.process_claim(&id);
+
+    let holder_after = f.usdc.balance(&holder);
+    let stranger_after = f.usdc.balance(&stranger);
+
+    // Verification:
+    // 1. Payout equals exact coverage amount
+    assert_eq!(payout, 1_000 * ONE_USDC);
+    // 2. Holder received 100% of payout
+    assert_eq!(holder_after - holder_before, 1_000 * ONE_USDC);
+    // 3. Stranger received 0 USDC (cannot divert funds)
+    assert_eq!(stranger_after, stranger_before);
+    // 4. Policy status is Claimed
+    assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Claimed);
+}
+
+#[test]
+fn griefing_stranger_cannot_prematurely_expire_active_policy() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // Advance 10 days (policy is active, duration is 30 days)
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 10 * 86_400;
+    });
+
+    // Stranger attempts to call expire_policy prematurely
+    let res = f.pool.try_expire_policy(&id);
+    assert_eq!(res, Err(Ok(PoolError::PolicyNotYetExpired)));
+
+    // Policy is still active, coverage still reserved
+    assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Active);
+
+    // Now advance past expiry (31 days total)
+    f.env.ledger().with_mut(|li| {
+        li.timestamp += 21 * 86_400;
+    });
+
+    // Now expire_policy succeeds
+    let res_after = f.pool.expire_policy(&id);
+    assert_eq!(res_after, ());
+    assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Expired);
+}
+
+#[test]
+fn griefing_stranger_untriggered_claim_fails_cleanly() {
+    let f = setup();
+    let lp = funded(&f, 100_000 * ONE_USDC);
+    f.pool.provide_capital(&lp, &(100_000 * ONE_USDC));
+
+    let holder = funded(&f, 1_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500, // depeg below $0.95
+    };
+    let id = f.pool.buy_policy(&holder, &params);
+
+    // Oracle price is $0.99 (normal, NOT triggered)
+    f.pool.update_oracle(
+        &f.admin,
+        &CoverageType::StablecoinDepeg,
+        &(99 * ONE_USDC / 100),
+    );
+
+    let holder_before = f.usdc.balance(&holder);
+
+    // Stranger attempts to trigger claim prematurely
+    let res = f.pool.try_process_claim(&id);
+    assert_eq!(res, Err(Ok(PoolError::PolicyNotTriggered)));
+
+    // Policy remains Active, holder balance untouched
+    assert_eq!(f.pool.get_policy(&id).unwrap().status, PolicyStatus::Active);
+    assert_eq!(f.usdc.balance(&holder), holder_before);
+}
+
