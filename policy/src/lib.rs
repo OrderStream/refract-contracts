@@ -1,39 +1,64 @@
 //! Refract Policy Registry Contract
 //!
 //! Stores all policy metadata on-chain as a lightweight sidecar to the Pool
-//! contract.  The Pool contract is the source of truth for capital; this
+//! contract. The Pool contract is the source of truth for capital; this
 //! contract provides a queryable index of policies per holder.
+//!
+//! # Architecture and Invariants
+//!
+//! - **Source of Truth**: The Pool contract is the source of truth for capital and
+//!   policy IDs. The registry does not mint IDs independently; it mirrors the IDs
+//!   allocated by the Pool contract so both contracts stay in lockstep.
+//! - **Access Control**: Only the authorized Pool contract or the admin may register
+//!   or deactivate policies via [`register_policy`](RefractPolicyRegistry::register_policy)
+//!   and [`deactivate_policy`](RefractPolicyRegistry::deactivate_policy).
+//! - **Idempotent Deactivation**: Deactivating an already inactive policy is a safe no-op,
+//!   preventing event spam and underflow of active policy counters.
+//! - **Cross-contract Type Parity**: [`CoverageType`] matches the enum layout of
+//!   `RegistryCoverageType` in the pool contract crate.
 
 #![no_std]
+#![warn(missing_docs)]
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
 };
 
-/// Coverage types (must match RefractPool enum).
+/// Coverage types offered across the protocol (must match RefractPool enum).
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum CoverageType {
+    /// Coverage against stablecoin peg deviation (e.g. USDC < $0.95).
     StablecoinDepeg = 0,
+    /// Coverage against broad market drawdowns (e.g. 24h return < -30%).
     MarketCrash = 1,
+    /// Protection against DeFi collateral liquidation events.
     LiquidationShield = 2,
+    /// Coverage against smart contract exploits or protocol TVL collapse.
     SmartContractRisk = 3,
+    /// Parametric flight delay coverage (> 120 minutes).
     FlightDelay = 4,
 }
 
 /// Errors returned by the registry. State-changing entrypoints still call
 /// `require_auth()` directly (which panics on a missing/invalid signature —
 /// that failure mode is not recoverable), but every *recoverable* misuse
-/// (wrong principal, unknown policy, double init) now returns a typed error
+/// (wrong principal, unknown policy, double init) returns a typed error
 /// instead of panicking, matching the convention used by `RefractPool`.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum RegistryError {
+    /// Contract has already been initialized.
     AlreadyInitialized = 1,
+    /// Contract has not yet been initialized.
     NotInitialized = 2,
+    /// Caller is not authorized to perform the requested operation.
     Unauthorized = 3,
+    /// Requested policy ID was not found in storage.
     PolicyNotFound = 4,
+    /// A policy with the specified ID already exists in storage.
     PolicyAlreadyExists = 5,
 }
 
@@ -44,39 +69,62 @@ pub enum RegistryError {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PolicyRegistration {
+    /// Unique policy ID assigned by the Pool contract.
     pub policy_id: u64,
+    /// Address of the policyholder.
     pub holder: Address,
+    /// Type of insurance coverage.
     pub coverage_type: CoverageType,
-    pub coverage_amount: i128, // 1e7 USDC
-    pub premium: i128,         // 1e7 USDC
-    pub expires_at: u64,       // unix timestamp
+    /// Covered payout amount in 1e7 USDC units.
+    pub coverage_amount: i128,
+    /// Upfront premium paid in 1e7 USDC units.
+    pub premium: i128,
+    /// Unix timestamp when coverage expires.
+    pub expires_at: u64,
 }
 
-/// On-chain policy record.
+/// On-chain policy record stored in contract persistent storage.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyRecord {
+    /// Unique policy ID assigned by the Pool contract.
     pub policy_id: u64,
+    /// Address of the policyholder.
     pub holder: Address,
+    /// Type of insurance coverage.
     pub coverage_type: CoverageType,
-    pub coverage_amount: i128, // 1e7 USDC
-    pub premium: i128,         // 1e7 USDC
-    pub expires_at: u64,       // unix timestamp
+    /// Covered payout amount in 1e7 USDC units.
+    pub coverage_amount: i128,
+    /// Upfront premium paid in 1e7 USDC units.
+    pub premium: i128,
+    /// Unix timestamp when coverage expires.
+    pub expires_at: u64,
+    /// Whether the policy is currently active.
     pub is_active: bool,
+    /// Unix timestamp when the policy was registered.
     pub created_at: u64,
 }
 
+/// Storage keys for contract instance and persistent storage.
 #[contracttype]
 pub enum DataKey {
+    /// Admin address key (instance storage).
     Admin,
+    /// Authorized Pool contract address key (instance storage).
     PoolContract,
-    Policy(u64),             // policy_id → PolicyRecord
-    HolderPolicies(Address), // address → Vec<u64>
+    /// Policy record mapped by policy ID (persistent storage).
+    Policy(u64),
+    /// List of policy IDs mapped by holder address (persistent storage).
+    HolderPolicies(Address),
+    /// Cumulative count of registered policies (instance storage).
     TotalPolicies,
+    /// Cumulative volume of collected premiums in 1e7 USDC (instance storage).
     TotalPremium,
+    /// Count of currently active policies (instance storage).
     ActivePolicies,
 }
 
+/// Refract Policy Registry smart contract.
 #[contract]
 pub struct RefractPolicyRegistry;
 
@@ -84,6 +132,9 @@ pub struct RefractPolicyRegistry;
 impl RefractPolicyRegistry {
     // ─── Initialization ───────────────────────────────────────────────────
 
+    /// Initialize the policy registry contract with an admin and pool contract address.
+    ///
+    /// Returns [`RegistryError::AlreadyInitialized`] if already initialized.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -191,6 +242,10 @@ impl RefractPolicyRegistry {
         Ok(policy_id)
     }
 
+    /// Deactivate an active policy upon claim settlement or expiration.
+    ///
+    /// If the policy is already inactive, this is a no-op to prevent duplicate event
+    /// emission or underflow of active policy counters.
     pub fn deactivate_policy(
         env: Env,
         caller: Address,
@@ -233,7 +288,7 @@ impl RefractPolicyRegistry {
     // ─── Admin ────────────────────────────────────────────────────────────
 
     /// Repoint the RefractPool this registry trusts to call
-    /// register_policy()/deactivate_policy(). Only needed after a pool
+    /// `register_policy()`/`deactivate_policy()`. Only needed after a pool
     /// redeploy/migration — `initialize` already wires the pool address
     /// set at deploy time. Deliberately admin-only rather than
     /// admin-or-pool (unlike register_policy/deactivate_policy): the pool
@@ -269,6 +324,7 @@ impl RefractPolicyRegistry {
 
     // ─── Queries ──────────────────────────────────────────────────────────
 
+    /// Retrieve the [`PolicyRecord`] for a given policy ID.
     pub fn get_policy(env: Env, policy_id: u64) -> Result<PolicyRecord, RegistryError> {
         env.storage()
             .persistent()
@@ -276,6 +332,7 @@ impl RefractPolicyRegistry {
             .ok_or(RegistryError::PolicyNotFound)
     }
 
+    /// Retrieve all policy IDs associated with a given holder address.
     pub fn get_holder_policy_ids(env: Env, holder: Address) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -309,6 +366,7 @@ impl RefractPolicyRegistry {
         active
     }
 
+    /// Retrieve aggregate registry statistics (total policies, total premium volume, active count).
     pub fn get_stats(env: Env) -> Map<Symbol, i128> {
         let mut stats: Map<Symbol, i128> = Map::new(&env);
         let total: u64 = env

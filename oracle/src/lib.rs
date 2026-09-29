@@ -1,27 +1,46 @@
 //! Refract Oracle Contract
 //!
 //! A permissioned price / event oracle that the RefractPool calls to verify
-//! trigger conditions before processing claims.  In production this would be
+//! trigger conditions before processing claims. In production this would be
 //! connected to Band Protocol, Pyth, or a Refract-operated relay.
+//!
+//! # Architecture and Invariants
+//!
+//! - **Fixed-Point Scaling**: All price and ratio values are represented as signed
+//!   integers scaled by [`SCALE`] (1e7 precision), ensuring zero floating-point arithmetic.
+//! - **Staleness Windows**: Readings must be fresher than [`MAX_STALENESS_SECS`] (1,800 seconds / 30 minutes).
+//! - **Future Timestamp Defense**: Readings dated beyond the current ledger timestamp are
+//!   rejected with [`OracleError::FutureTimestamp`].
+//! - **Monotonic Ordering & Multi-Relayer Safety**: Because multiple relayers may submit concurrently
+//!   without centralized scheduling, submissions cannot regress feed history backward in time.
+//!   Any reading with a timestamp older than the stored reading for that feed is rejected with
+//!   [`OracleError::StaleSubmission`].
 
 #![no_std]
+#![warn(missing_docs)]
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
 };
 
 /// Maximum oracle staleness in seconds (30 minutes).
-const MAX_STALENESS_SECS: u64 = 1_800;
+pub const MAX_STALENESS_SECS: u64 = 1_800;
 
 /// Fixed-point scale for value readings (1e7). All prices/percentages are
 /// stored as `value * 1e7` so the contract never touches floating point.
-const SCALE: i128 = 10_000_000;
+pub const SCALE: i128 = 10_000_000;
 
 // ── Trigger thresholds (in `SCALE` fixed-point unless noted) ────────────────
-const DEPEG_PRICE_THRESHOLD: i128 = 95 * SCALE / 100; // USDC < $0.95
-const CRASH_RETURN_THRESHOLD: i128 = -30 * SCALE / 100; // 24h return < -30%
-const LIQUIDATION_RATIO_THRESHOLD: i128 = 85 * SCALE / 100; // ratio < 85%
-const TVL_THRESHOLD: i128 = 500_000 * SCALE; // protocol TVL < $500k
-const FLIGHT_DELAY_THRESHOLD: i128 = 120; // delay in minutes (not scaled)
+/// Trigger threshold for stablecoin depeg: USDC < $0.95 (0.95 * SCALE).
+pub const DEPEG_PRICE_THRESHOLD: i128 = 95 * SCALE / 100;
+/// Trigger threshold for market crash: 24h return < -30% (-0.30 * SCALE).
+pub const CRASH_RETURN_THRESHOLD: i128 = -30 * SCALE / 100;
+/// Trigger threshold for liquidation ratio: ratio < 85% (0.85 * SCALE).
+pub const LIQUIDATION_RATIO_THRESHOLD: i128 = 85 * SCALE / 100;
+/// Trigger threshold for smart contract risk TVL: TVL < $500,000.
+pub const TVL_THRESHOLD: i128 = 500_000 * SCALE;
+/// Trigger threshold for flight delay: duration > 120 minutes (unscaled).
+pub const FLIGHT_DELAY_THRESHOLD: i128 = 120;
 
 /// Errors returned by the oracle. `require_auth()` still panics on a
 /// missing/invalid signature (unrecoverable); every other recoverable
@@ -32,14 +51,22 @@ const FLIGHT_DELAY_THRESHOLD: i128 = 120; // delay in minutes (not scaled)
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum OracleError {
+    /// Contract has already been initialized.
     AlreadyInitialized = 1,
+    /// Contract has not yet been initialized.
     NotInitialized = 2,
+    /// Caller is not authorized to perform this operation.
     Unauthorized = 3,
+    /// Requested oracle feed ID was not found.
     FeedNotFound = 4,
+    /// Reading timestamp is older than the maximum staleness window.
     StaleReading = 5,
+    /// Supplied coverage type is unrecognized for trigger evaluation.
     UnknownCoverageType = 6,
+    /// Submitted timestamp is in the future relative to the ledger time.
     FutureTimestamp = 7,
-    StaleSubmission = 8, // older than the reading already stored for this feed
+    /// Submitted reading timestamp is older than the reading already stored for this feed.
+    StaleSubmission = 8,
 }
 
 /// Oracle reading stored on-chain.
@@ -51,17 +78,24 @@ pub struct OracleReading {
     /// For percentages: percent * 1e7 (e.g. -30% = -3_000_000).
     /// For durations: minutes.
     pub value: i128,
+    /// Unix timestamp when the reading was captured.
     pub timestamp: u64,
+    /// Source or provider identifier for the reading.
     pub source: Symbol,
 }
 
+/// Storage keys for oracle contract instance and persistent storage.
 #[contracttype]
 pub enum DataKey {
+    /// Contract administrator address key (instance storage).
     Admin,
+    /// List of authorized relayer addresses (instance storage).
     Relayers,
-    Reading(Symbol), // feed_id → OracleReading
+    /// Oracle reading mapped by feed symbol (persistent storage).
+    Reading(Symbol),
 }
 
+/// Refract Oracle smart contract.
 #[contract]
 pub struct RefractOracle;
 
@@ -69,6 +103,9 @@ pub struct RefractOracle;
 impl RefractOracle {
     // ─── Initialization ──────────────────────────────────────────────────
 
+    /// Initialize the oracle contract with an administrator address.
+    ///
+    /// Returns [`OracleError::AlreadyInitialized`] if already initialized.
     pub fn initialize(env: Env, admin: Address) -> Result<(), OracleError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(OracleError::AlreadyInitialized);
@@ -82,6 +119,7 @@ impl RefractOracle {
 
     // ─── Admin ───────────────────────────────────────────────────────────
 
+    /// Add an authorized relayer address allowed to submit oracle readings.
     pub fn add_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
         let mut relayers: Vec<Address> = env
@@ -98,6 +136,7 @@ impl RefractOracle {
         Ok(())
     }
 
+    /// Remove an authorized relayer address.
     pub fn remove_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
         let relayers: Vec<Address> = env
@@ -154,7 +193,13 @@ impl RefractOracle {
     // ─── Data submission ─────────────────────────────────────────────────
 
     /// Submit a reading for a given feed.
-    /// feed_id examples: USDC_PRICE, MARKET_24H_RETURN, XLM_TVL, FLIGHT_DL420
+    /// feed_id examples: `USDC_PRICE`, `MARKET_24H_RETURN`, `XLM_TVL`, `FLIGHT_DL420`.
+    ///
+    /// Validates that:
+    /// 1. Caller is an authorized relayer or contract admin.
+    /// 2. Timestamp is not in the future relative to the ledger time.
+    /// 3. Reading is not older than [`MAX_STALENESS_SECS`].
+    /// 4. Timestamp is greater than or equal to any currently stored reading for this feed.
     pub fn submit(
         env: Env,
         relayer: Address,
@@ -238,7 +283,7 @@ impl RefractOracle {
     }
 
     /// Returns true if the trigger condition for a given coverage type is met.
-    /// coverage_type: 0=Depeg, 1=Crash, 2=Liquidation, 3=SmartContract, 4=Flight
+    /// coverage_type: 0=Depeg, 1=Crash, 2=Liquidation, 3=SmartContract, 4=Flight.
     pub fn is_triggered(
         env: Env,
         coverage_type: u32,
