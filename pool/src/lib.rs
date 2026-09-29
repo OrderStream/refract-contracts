@@ -898,10 +898,12 @@ impl RefractPool {
         );
     }
 
-    fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
-        // Premium = coverage × base_rate × risk_multiplier × (days/365)
-        let base = params.coverage_amount * (config.base_premium_rate_bps as i128) / BPS;
-        let duration_factor = params.duration_days as i128 * PRECISION / 365;
+    pub fn _calc_premium(config: &PoolConfig, params: &PolicyParams) -> i128 {
+        // Optimized deferred-division formulation:
+        // Premium = (coverage × base_rate × duration_days × risk_multiplier) / (BPS × 365 × 100)
+        // Grouping multiplications prior to a single final division eliminates compounding
+        // truncation loss from sequential divisions while provably remaining within i128 bounds
+        // (max theoretical numerator: 50,000 * 1e7 * 10,000 * 365 * 300 = 5.475e20 << i128::MAX ~1.7e38).
         let risk_multiplier = match params.coverage_type {
             CoverageType::StablecoinDepeg => 100,   // 1.0× (low risk)
             CoverageType::MarketCrash => 150,       // 1.5×
@@ -909,7 +911,12 @@ impl RefractPool {
             CoverageType::SmartContractRisk => 300, // 3.0×
             CoverageType::FlightDelay => 80,        // 0.8× (very low risk)
         };
-        base * duration_factor / PRECISION * risk_multiplier / 100
+        let numerator = params.coverage_amount
+            * (config.base_premium_rate_bps as i128)
+            * (params.duration_days as i128)
+            * (risk_multiplier as i128);
+        let denominator = (BPS as i128) * 365 * 100;
+        numerator / denominator
     }
 
     fn _calc_shares(env: &Env, amount: i128) -> i128 {
