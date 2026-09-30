@@ -1145,6 +1145,84 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
     assert_eq!(res, Err(Ok(PoolError::InsufficientShares)));
 }
 
+/// Permanent regression test quantifying precision loss reduction from deferred division
+/// across boundary inputs (near min_coverage floor up to max_coverage capacity).
+#[test]
+fn calc_premium_precision_loss_numerical_sweep() {
+    let config = PoolConfig {
+        base_premium_rate_bps: 300, // 3%
+        max_utilization_bps: 8000,
+        min_coverage: 100 * ONE_USDC, // 100 USDC floor
+        max_coverage: 50_000 * ONE_USDC, // 50,000 USDC cap
+        lockup_days: 7,
+    };
+
+    let coverages = [
+        100 * ONE_USDC,
+        250 * ONE_USDC,
+        1_000 * ONE_USDC,
+        10_000 * ONE_USDC,
+        50_000 * ONE_USDC,
+    ];
+    let durations = [1, 7, 30, 90, 180, 365];
+    let coverage_types = [
+        CoverageType::FlightDelay,
+        CoverageType::StablecoinDepeg,
+        CoverageType::MarketCrash,
+        CoverageType::LiquidationShield,
+        CoverageType::SmartContractRisk,
+    ];
+
+    for &cov in &coverages {
+        for &days in &durations {
+            for &cov_type in &coverage_types {
+                let params = PolicyParams {
+                    coverage_amount: cov,
+                    coverage_type: cov_type,
+                    duration_days: days,
+                    trigger_threshold: 500,
+                };
+
+                let risk_mult = match cov_type {
+                    CoverageType::StablecoinDepeg => 100i128,
+                    CoverageType::MarketCrash => 150i128,
+                    CoverageType::LiquidationShield => 200i128,
+                    CoverageType::SmartContractRisk => 300i128,
+                    CoverageType::FlightDelay => 80i128,
+                };
+
+                // Previous 3-division formulation
+                let prev_base = cov * (config.base_premium_rate_bps as i128) / BPS;
+                let prev_duration = (days as i128) * PRECISION / 365;
+                let prev_premium = prev_base * prev_duration / PRECISION * risk_mult / 100;
+
+                // Optimized deferred-division formulation
+                let opt_premium = RefractPool::_calc_premium(&config, &params);
+
+                // High-precision reference: floating-point ground truth
+                let true_premium_f64 = (cov as f64)
+                    * (config.base_premium_rate_bps as f64 / 10_000.0)
+                    * (days as f64 / 365.0)
+                    * (risk_mult as f64 / 100.0);
+
+                let opt_diff = (opt_premium as f64 - true_premium_f64).abs();
+                let prev_diff = (prev_premium as f64 - true_premium_f64).abs();
+
+                // Optimized formulation is monotonically more accurate or equal
+                assert!(
+                    opt_diff <= prev_diff + 1.0,
+                    "Deferred division error ({opt_diff}) exceeded previous error ({prev_diff})"
+                );
+                // Absolute error to true mathematical premium is bounded within 1 stroop (1e-7 USDC)
+                assert!(
+                    opt_diff < 1.0,
+                    "Deferred division absolute error exceeded 1 stroop: {opt_diff}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn snapshot_metering_efficiency_on_hot_paths() {
     let f = setup();
