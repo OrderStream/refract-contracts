@@ -36,6 +36,9 @@ jobs:
 
       - name: Build optimized wasm
         run: cargo build --target wasm32-unknown-unknown --release
+      - name: Soroban static-analysis gate
+        run: python3 scripts/check_soroban_footguns.py
+
       - name: SDK upgrade verification gate
         run: python3 scripts/verify_sdk_upgrade.py
 
