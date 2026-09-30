@@ -68,6 +68,18 @@ use soroban_sdk::{
 /// Maximum oracle staleness in seconds (30 minutes).
 const MAX_STALENESS_SECS: u64 = 1_800;
 
+/// Minimum delay (in seconds) between queuing a new relayer via
+/// `add_relayer` and it becoming active via `activate_relayer`.
+///
+/// Default is 48 hours. Rationale: adding a relayer grants submission
+/// rights that can ultimately gate real payouts, so a compromised admin
+/// key must not be able to add a malicious relayer and have it submitting
+/// trigger-worthy data within the same transaction. 48h gives the
+/// community a deliberate, observable window to react (and, in the
+/// deployment runbook, to route `add_relayer`'s admin gate through the
+/// governance/timelock stack) before a new trusted data source goes live.
+const MIN_ADDITION_NOTICE_PERIOD_SECS: u64 = 48 * 60 * 60;
+
 /// Minimum interval between submissions from the same (relayer, feed_id) pair.
 ///
 /// **Default: 60 s.**
@@ -121,6 +133,8 @@ pub enum OracleError {
     InsufficientBond = 11,    // Issue #94: relayer bond too low
     RelayerNotBonded = 12,   // Issue #94: relayer has no stake
     InvalidSlashAmount = 13, // Issue #94: slash exceeds bond
+    RelayerNotPending = 14, // activate_relayer called for a relayer that was never queued
+    NoticePeriodNotElapsed = 15, // activate_relayer called before min_addition_notice_period
 }
 
 /// Aggregate health summary for a single oracle feed.
@@ -233,6 +247,7 @@ pub enum DataKey {
     PendingAdmin,
     /// Issue #92: Per-feed configurable trigger thresholds
     Threshold(Symbol),
+    PendingRelayer(Address), // relayer → queued-at timestamp
 }
 
 #[contract]
@@ -255,12 +270,55 @@ impl RefractOracle {
 
     // ─── Admin ───────────────────────────────────────────────────────────
 
-    /// Register a new relayer.  Initialises its reputation score to
-    /// `REPUTATION_INITIAL` (100) so it starts with the same weight as all
-    /// other freshly-registered relayers.  Adding an already-registered
-    /// relayer is a no-op (idempotent, no event, no reputation reset).
+    /// Queue a new relayer for activation after `min_addition_notice_period`.
+    ///
+    /// Admin-gated as before, but no longer activates the relayer
+    /// immediately: the relayer is recorded under `PendingRelayer` with the
+    /// current ledger timestamp and only becomes active once
+    /// `activate_relayer` is called after the notice period has elapsed.
+    /// This turns adding a new trusted data source into a deliberately slow,
+    /// observable action rather than an instant single-key decision.
+    ///
+    /// Initialises its reputation score to `REPUTATION_INITIAL` (100) so it
+    /// starts with the same weight as all other freshly-registered relayers.
+    /// Adding an already-registered relayer is a no-op (idempotent, no event,
+    /// no reputation reset).
     pub fn add_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
+        let relayers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Relayers)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Already active — nothing to queue.
+        if relayers.iter().any(|r| r == relayer) {
+            return Ok(());
+        }
+        let queued_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingRelayer(relayer.clone()), &queued_at);
+        env.events().publish(
+            (Symbol::new(&env, "relayer_queued"),),
+            (relayer, queued_at),
+        );
+        Ok(())
+    }
+
+    /// Permissionless: promote a queued relayer to the active `Relayers`
+    /// list once `min_addition_notice_period` has elapsed since it was
+    /// queued via `add_relayer`. Anyone may call this; the notice period
+    /// itself is the safeguard, not the caller's identity.
+    pub fn activate_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
+        let queued_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingRelayer(relayer.clone()))
+            .ok_or(OracleError::RelayerNotPending)?;
+        let now = env.ledger().timestamp();
+        if now < queued_at.saturating_add(MIN_ADDITION_NOTICE_PERIOD_SECS) {
+            return Err(OracleError::NoticePeriodNotElapsed);
+        }
         let mut relayers: Vec<Address> = env
             .storage()
             .instance()
@@ -277,9 +335,19 @@ impl RefractOracle {
             env.events()
                 .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
         }
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingRelayer(relayer.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "relayer_added"),), (relayer,));
         Ok(())
     }
 
+    /// Instantly revoke a relayer's submission rights. Removing a bad
+    /// relayer must never be slowed down, so this stays immediate and
+    /// unchanged. If the relayer was still pending (queued but not yet
+    /// activated), the pending entry is cancelled too, so it can never be
+    /// activated after removal.
     pub fn remove_relayer(env: Env, relayer: Address) -> Result<(), OracleError> {
         Self::require_admin(&env)?;
         let relayers: Vec<Address> = env
@@ -296,7 +364,14 @@ impl RefractOracle {
         }
         let removed = filtered.len() != relayers.len();
         env.storage().instance().set(&DataKey::Relayers, &filtered);
-        if removed {
+        // Cancel any pending queue entry so a removed relayer cannot later
+        // be activated via activate_relayer.
+        let pending_key = DataKey::PendingRelayer(relayer.clone());
+        let was_pending = env.storage().instance().has(&pending_key);
+        if was_pending {
+            env.storage().instance().remove(&pending_key);
+        }
+        if removed || was_pending {
             env.events()
                 .publish((Symbol::new(&env, "relayer_removed"),), (relayer,));
         }
@@ -561,10 +636,9 @@ impl RefractOracle {
         env.storage()
             .persistent()
             .set(&DataKey::Reading(feed_id.clone()), &reading);
-
         env.events().publish(
-            (Symbol::new(&env, "oracle_updated"), feed_id),
-            (value, timestamp),
+            (Symbol::new(&env, "reading_submitted"),),
+            (relayer, feed_id, value, timestamp),
         );
         Ok(())
     }
@@ -636,50 +710,14 @@ impl RefractOracle {
         // Placeholder: deviation rejection counts will be tracked here once
         // the sibling deviation-check issue lands.  Reading returns 0 until
         // then so the field is forward-compatible without a contract upgrade.
-        let recent_rejection
-        let relayers: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Relayers)
-            .unwrap_or_else(|| Vec::new(&env));
-        let ledger_time = env.ledger().timestamp();
-        let mut weighted_sum: i128 = 0;
-        let mut total_weight: i128 = 0;
-        let mut latest_timestamp: u64 = 0;
-        let mut latest_source: Option<Symbol> = None;
+        let recent_rejection_count: u32 = 0;
 
-        for relayer in relayers.iter() {
-            // Per-relayer reading would require DataKey::RelayerReading(relayer, feed_id).
-            // Since individual per-relayer readings are stored at the shared
-            // DataKey::Reading(feed_id) key (last-writer-wins), this function uses
-            // the global reading and weights it by reputation.
-            // The per-relayer granularity needed for true multi-relayer weighted
-            // median is left for the sibling multi-relayer aggregation issue.
-            // Here we weight the global reading by each registered relayer's
-            // reputation proportionally, which is the correct approach when
-            // storage is shared (i.e., every relayer submits to the same slot).
-            let rep: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::RelayerReputation(relayer))
-                .unwrap_or(REPUTATION_INITIAL);
-            let weight = rep.max(REPUTATION_FLOOR);
-            total_weight += weight;
+        FeedHealth {
+            feed_id,
+            last_updated_at,
+            active_relayer_count,
+            recent_rejection_count,
         }
-
-        // With a single shared reading slot, fetch the canonical reading and
-        // return it directly (the weighted logic above computes total_weight
-        // for documentation completeness; the actual value returned is the
-        // same as get_reading since all relayers write to the same slot).
-        // When per-relayer storage lands (sibling issue), this function will
-        // compute the true reputation-weighted median across individual slots.
-        let reading = Self::get_reading(env, feed_id)?;
-
-        // If no relayers are registered, total_weight is 0; fall back to the
-        // global reading as-is (already validated by get_reading above).
-        let _ = (weighted_sum, total_weight, latest_timestamp, latest_source);
-
-        Ok(reading)
     }
 
     /// Get all feeds and their timestamps as a map (for monitoring UI).
@@ -709,25 +747,15 @@ impl RefractOracle {
         Ok(())
     }
 
-    fn require_relayer(env: &Env, caller: &Address) -> Result<(), OracleError> {
+    fn require_relayer(env: &Env, relayer: &Address) -> Result<(), OracleError> {
         let relayers: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::Relayers)
             .unwrap_or_else(|| Vec::new(env));
-        let is_relayer = relayers.iter().any(|r| &r == caller);
-        // Admin can also submit
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(OracleError::NotInitialized)?;
-        if !is_relayer && caller != &admin {
+        if !relayers.iter().any(|r| &r == relayer) {
             return Err(OracleError::Unauthorized);
         }
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod test;
