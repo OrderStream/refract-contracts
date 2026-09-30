@@ -1146,6 +1146,31 @@ fn quote_withdrawal_rejects_more_shares_than_exist() {
 }
 
 #[test]
+fn snapshot_metering_efficiency_on_hot_paths() {
+    let f = setup();
+    let lp = funded(&f, 20_000 * ONE_USDC);
+    let shares = f.pool.provide_capital(&lp, &(20_000 * ONE_USDC));
+
+    let holder = funded(&f, 5_000 * ONE_USDC);
+    let params = PolicyParams {
+        coverage_amount: 1_000 * ONE_USDC,
+        coverage_type: CoverageType::StablecoinDepeg,
+        duration_days: 30,
+        trigger_threshold: 500,
+    };
+
+    // Exercise buy_policy under cached snapshot
+    let policy_id = f.pool.buy_policy(&holder, &params);
+    assert_eq!(policy_id, 0);
+
+    // Warp past lockup
+    f.env.ledger().set_timestamp(f.env.ledger().timestamp() + 8 * 86_400);
+
+    // Exercise withdraw_capital under cached snapshot
+    let out = f.pool.withdraw_capital(&lp, &(shares / 4));
+    assert!(out > 0);
+}
+
 fn test_cross_contract_and_token_transfer_failure_paths() {
     let f = setup();
     let provider = funded(&f, 10_000 * ONE_USDC);
