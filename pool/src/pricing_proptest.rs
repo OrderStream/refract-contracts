@@ -166,6 +166,15 @@
 //! hand-set `TotalCapital`/`TotalShares` values rather than going through
 //! the full `provide_capital` entrypoint — this isolates the pricing math
 //! itself from token transfers and auth.
+//!
+//! # Snapshot Management
+//!
+//! Storage-backed tests reading `TotalCapital`/`TotalShares` need a live `Env`,
+//! and every `Env::default()` writes its own cost/budget snapshot to `test_snapshots/`.
+//! Letting `proptest!` generate a fresh `Env` per case (its default is 256 cases) would
+//! leave hundreds of throwaway snapshot files behind. Therefore, those tests drive cases
+//! manually through `TestRunner` against a single `Env` created once, matching the
+//! "one snapshot per test function" convention across this repository.
 
 use super::*;
 use ::proptest::prelude::*;
