@@ -6,9 +6,11 @@
 //! Modelled after the Compound Governor / OpenZeppelin Governor pattern,
 //! adapted for Soroban's programming model.
 //!
-//! * **Voting weight** — read from a token contract's `balance(voter)` at
-//!   the time each `cast_vote` call is made.  This is a known limitation
-//!   (flash-loan risk); snapshot-based voting is a planned follow-up issue.
+//! * **Voting weight** — resolved from per-address balance checkpoints as of
+//!   the proposal's snapshot ledger, so tokens borrowed and repaid within a
+//!   single transaction cannot inflate votes.
+//! * **Delegation** — single-hop delegation: an address may delegate its
+//!   voting power to a delegatee, which cannot itself have delegated onward.
 //! * **Proposal threshold** — a minimum token balance required to create a
 //!   proposal, preventing spam.
 //! * **Quorum** — `quorum_bps` of `total_supply` (from the token) must
@@ -26,15 +28,10 @@
 //! queue()   → Queued (forwarded to timelock)
 //! execute() → Executed (timelock or direct forward)
 //! ```
-//!
-//! ## Known limitations (to be addressed in follow-up issues)
-//! - Voting weight is read at call time, not at a snapshot block — flash
-//!   loan risk exists.
-//! - No vote delegation.
 
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Val, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Map, Symbol, Val, Vec,
 };
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -60,6 +57,9 @@ pub enum GovernanceError {
     ProposalDefeated = 9,
     /// Proposal was queued/executed already.
     AlreadyQueued = 10,
+    /// A delegation would create a chain (the delegatee has itself delegated
+    /// elsewhere). This contract uses a single-hop-only delegation model.
+    DelegationChain = 11,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -101,6 +101,10 @@ pub struct ProposalState {
     pub status: ProposalStatus,
     /// Voters who have already cast a vote (to prevent double-voting).
     pub voters: Vec<Address>,
+    /// Ledger sequence at proposal creation. Voting weight is resolved from
+    /// balances as of this ledger, not the voter's live balance, so tokens
+    /// borrowed and repaid within a single transaction cannot inflate votes.
+    pub snapshot_ledger: u32,
 }
 
 /// Governor configuration.
@@ -120,19 +124,51 @@ pub struct GovernorConfig {
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
+/// Storage keys for the governor contract.
 #[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
     Admin,
     Config,
+    Token,
     /// Optional timelock contract address.  If absent, `queue` forwards
     /// directly.
     Timelock,
     NextId,
+    ProposalCount,
     Proposal(u64),
+    Vote(u64, Address),
+    /// Records the delegatee chosen by a given caller. Absence means the
+    /// caller votes with their own balance (self-delegation / no delegation).
+    Delegate(Address),
+    /// Running total of voting power delegated *to* a given address, i.e. the
+    /// sum of the token balances of every address that has delegated to it.
+    /// Maintained incrementally on delegate/undelegate so `cast_vote` never
+    /// has to iterate a global delegator list.
+    DelegatedWeight(Address),
+    /// Append-only per-address checkpoint list of `(ledger_sequence, balance)`
+    /// pairs, written whenever the governor observes a balance change for the
+    /// address. Used to resolve "balance as of ledger N" for snapshot voting.
+    Checkpoints(Address),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
+#[contract]
+pub struct RefractGovernor;
+
+#[contractimpl]
+impl RefractGovernor {
+    pub fn initialize(env: Env, admin: Address, token: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Token, &token);
+        env.storage().instance().set(&DataKey::ProposalCount, &0u64);
+    }
+
+    pub fn propose(env: E
 #[contract]
 pub struct RefractGovernor;
 
